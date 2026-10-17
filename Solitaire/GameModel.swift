@@ -83,6 +83,8 @@ struct GameSnapshot {
     var foundations: [[Card]]
     var tableau: [[Card]]
     var moves: Int
+    var baseScore: Int
+    var lastDelta: Int
 }
 
 @MainActor
@@ -97,13 +99,40 @@ final class SolitaireGame {
     var startDate = Date()
     var winDate: Date?
     var isWon = false
+    var dealGeneration = 0
+    var baseScore = 0
+    var lastDelta = 0
+    var finalScore: Int?
 
     private var history: [GameSnapshot] = []
 
-    var canUndo: Bool { !history.isEmpty }
+    var canUndo: Bool { !history.isEmpty && !isWon }
 
     var elapsed: TimeInterval {
         (winDate ?? Date()).timeIntervalSince(startDate)
+    }
+
+    var timePenalty: Int {
+        let extra = max(0, elapsed - 30)
+        return Int(extra / 10) * 2
+    }
+
+    var timeBonus: Int {
+        guard isWon else { return 0 }
+        return max(0, 500 - Int(elapsed) * 2)
+    }
+
+    var currentScore: Int {
+        if let finalScore { return finalScore }
+        return max(0, baseScore - timePenalty)
+    }
+
+    var allTableauRevealed: Bool {
+        tableau.allSatisfy { $0.allSatisfy(\.isFaceUp) }
+    }
+
+    var canAutoFinish: Bool {
+        !isWon && stock.isEmpty && allTableauRevealed && simulatedFoundationWin()
     }
 
     init() {
@@ -116,9 +145,13 @@ final class SolitaireGame {
         }
         history.removeAll()
         moves = 0
+        baseScore = 0
+        lastDelta = 0
+        finalScore = nil
         isWon = false
         winDate = nil
         startDate = Date()
+        dealGeneration += 1
         deal()
     }
 
@@ -127,6 +160,7 @@ final class SolitaireGame {
         apply(snapshot)
         isWon = false
         winDate = nil
+        finalScore = nil
     }
 
     func drawFromStock() {
@@ -140,6 +174,11 @@ final class SolitaireGame {
                 return copy
             }
             waste.removeAll()
+            if drawCount == 3 {
+                applyScore(-20)
+            } else {
+                lastDelta = 0
+            }
             moves += 1
             return
         }
@@ -195,27 +234,79 @@ final class SolitaireGame {
     }
 
     @discardableResult
-    func move(from source: Pile, count: Int, to dest: Pile) -> Bool {
+    func move(from source: Pile, count: Int, to dest: Pile, recordUndo: Bool = true) -> Bool {
         guard !isWon, source != dest, count > 0 else { return false }
         guard let moving = peek(from: source, count: count), canDrop(moving, on: dest) else { return false }
-        pushUndo()
+        let willFlip = willFlipExposed(in: source, count: count)
+        if recordUndo { pushUndo() }
         _ = pop(from: source, count: count)
         append(moving, to: dest)
         flipExposed(in: source)
+        scoreMove(from: source, to: dest, flipped: willFlip)
         moves += 1
         checkWin()
         return true
     }
 
+    func suggestedMove(from pile: Pile, count: Int) -> Pile? {
+        guard count > 0, let cards = peek(from: pile, count: count) else { return nil }
+        if count == 1 {
+            for i in 0..<4 where canDrop(cards, on: .foundation(i)) {
+                return .foundation(i)
+            }
+        }
+        for column in 0..<7 {
+            let dest = Pile.tableau(column)
+            if dest != pile, canDrop(cards, on: dest) {
+                return dest
+            }
+        }
+        return nil
+    }
+
     @discardableResult
-    func autoMoveTop(from pile: Pile) -> Bool {
-        guard let card = topCard(of: pile) else { return false }
-        for i in 0..<4 {
-            if canDrop([card], on: .foundation(i)) {
-                return move(from: pile, count: 1, to: .foundation(i))
+    func autoMove(from pile: Pile, count: Int) -> Bool {
+        guard count > 0, let cards = peek(from: pile, count: count) else { return false }
+        if count == 1 {
+            for i in 0..<4 {
+                if canDrop(cards, on: .foundation(i)) {
+                    return move(from: pile, count: 1, to: .foundation(i))
+                }
+            }
+        }
+        for column in 0..<7 {
+            let dest = Pile.tableau(column)
+            if dest != pile, canDrop(cards, on: dest) {
+                return move(from: pile, count: count, to: dest)
             }
         }
         return false
+    }
+
+    func nextFoundationMove() -> (Pile, Pile)? {
+        if let card = waste.last {
+            for i in 0..<4 where canDrop([card], on: .foundation(i)) {
+                return (.waste, .foundation(i))
+            }
+        }
+        for column in 0..<7 {
+            guard let card = tableau[column].last else { continue }
+            for i in 0..<4 where canDrop([card], on: .foundation(i)) {
+                return (.tableau(column), .foundation(i))
+            }
+        }
+        return nil
+    }
+
+    func beginAutoFinish() {
+        guard canAutoFinish else { return }
+        pushUndo()
+    }
+
+    @discardableResult
+    func applyNextAutoFinishStep() -> Bool {
+        guard let (source, dest) = nextFoundationMove() else { return false }
+        return move(from: source, count: 1, to: dest, recordUndo: false)
     }
 
     func topCard(of pile: Pile) -> Card? {
@@ -310,16 +401,47 @@ final class SolitaireGame {
         }
     }
 
+    private func willFlipExposed(in pile: Pile, count: Int) -> Bool {
+        guard case .tableau(let column) = pile else { return false }
+        let remaining = tableau[column].count - count
+        guard remaining > 0 else { return false }
+        return !tableau[column][remaining - 1].isFaceUp
+    }
+
     private func flipExposed(in pile: Pile) {
         guard case .tableau(let column) = pile, var last = tableau[column].last, !last.isFaceUp else { return }
         last.isFaceUp = true
         tableau[column][tableau[column].count - 1] = last
     }
 
+    private func scoreMove(from source: Pile, to dest: Pile, flipped: Bool) {
+        var delta = 0
+        switch dest {
+        case .foundation:
+            delta += 10
+        case .tableau:
+            switch source {
+            case .waste: delta += 5
+            case .foundation: delta -= 15
+            default: break
+            }
+        default:
+            break
+        }
+        if flipped { delta += 5 }
+        applyScore(delta)
+    }
+
+    private func applyScore(_ delta: Int) {
+        lastDelta = delta
+        baseScore = max(0, baseScore + delta)
+    }
+
     private func checkWin() {
         if foundations.allSatisfy({ $0.count == 13 }) {
             isWon = true
             winDate = Date()
+            finalScore = max(0, baseScore - timePenalty) + timeBonus
         }
     }
 
@@ -330,7 +452,9 @@ final class SolitaireGame {
                 waste: waste,
                 foundations: foundations,
                 tableau: tableau,
-                moves: moves
+                moves: moves,
+                baseScore: baseScore,
+                lastDelta: lastDelta
             )
         )
         if history.count > 80 {
@@ -344,6 +468,47 @@ final class SolitaireGame {
         foundations = snapshot.foundations
         tableau = snapshot.tableau
         moves = snapshot.moves
+        baseScore = snapshot.baseScore
+        lastDelta = snapshot.lastDelta
+    }
+
+    private func simulatedFoundationWin() -> Bool {
+        var waste = waste
+        var tableau = tableau
+        var foundations = foundations
+
+        func foundationIndex(for card: Card) -> Int? {
+            for i in 0..<4 {
+                let dest = foundations[i]
+                if dest.isEmpty { if card.rank == .ace { return i } }
+                else if let top = dest.last,
+                        top.suit == card.suit,
+                        card.rank.rawValue == top.rank.rawValue + 1 {
+                    return i
+                }
+            }
+            return nil
+        }
+
+        while true {
+            if let card = waste.last, let i = foundationIndex(for: card) {
+                waste.removeLast()
+                foundations[i].append(card)
+                continue
+            }
+            var moved = false
+            for column in 0..<7 {
+                guard let card = tableau[column].last, let i = foundationIndex(for: card) else { continue }
+                tableau[column].removeLast()
+                foundations[i].append(card)
+                moved = true
+                break
+            }
+            if moved { continue }
+            break
+        }
+
+        return foundations.allSatisfy { $0.count == 13 }
     }
 }
 

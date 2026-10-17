@@ -115,7 +115,7 @@
 /* End PBXSourcesBuildPhase section */
 
 /* Begin XCBuildConfiguration section */
-		A11B2C3D4E5F60718293A4E1 /* Debug */ = {
+		A11B2C3D4E5F60718293A4E1 /* Debug configuration for PBXProject "Solitaire" */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
@@ -178,7 +178,7 @@
 			};
 			name = Debug;
 		};
-		A11B2C3D4E5F60718293A4E2 /* Release */ = {
+		A11B2C3D4E5F60718293A4E2 /* Release configuration for PBXProject "Solitaire" */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
@@ -234,7 +234,7 @@
 			};
 			name = Release;
 		};
-		A11B2C3D4E5F60718293A4F1 /* Debug */ = {
+		A11B2C3D4E5F60718293A4F1 /* Debug configuration for PBXNativeTarget "Solitaire" */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
@@ -269,7 +269,7 @@
 			};
 			name = Debug;
 		};
-		A11B2C3D4E5F60718293A4F2 /* Release */ = {
+		A11B2C3D4E5F60718293A4F2 /* Release configuration for PBXNativeTarget "Solitaire" */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
@@ -310,19 +310,17 @@
 		A11B2C3D4E5F60718293A4E8 /* Build configuration list for PBXProject "Solitaire" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
-				A11B2C3D4E5F60718293A4E1 /* Debug */,
-				A11B2C3D4E5F60718293A4E2 /* Release */,
+				A11B2C3D4E5F60718293A4E1 /* Debug configuration for PBXProject "Solitaire" */,
+				A11B2C3D4E5F60718293A4E2 /* Release configuration for PBXProject "Solitaire" */,
 			);
-			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
 		A11B2C3D4E5F60718293A4F0 /* Build configuration list for PBXNativeTarget "Solitaire" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
-				A11B2C3D4E5F60718293A4F1 /* Debug */,
-				A11B2C3D4E5F60718293A4F2 /* Release */,
+				A11B2C3D4E5F60718293A4F1 /* Debug configuration for PBXNativeTarget "Solitaire" */,
+				A11B2C3D4E5F60718293A4F2 /* Release configuration for PBXNativeTarget "Solitaire" */,
 			);
-			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
