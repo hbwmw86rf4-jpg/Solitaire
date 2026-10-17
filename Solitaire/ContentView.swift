@@ -54,13 +54,17 @@ struct ContentView: View {
     @State private var recordedWinID: UUID?
     @State private var bursts: [ScoreBurst] = []
     @AppStorage("leftHandedLayout") private var leftHanded = false
+    @AppStorage("tableTheme") private var tableTheme: TableTheme = .green
+    @AppStorage("cardBackTheme") private var cardBackTheme: CardBackTheme = .crimson
+    @AppStorage("faceTheme") private var faceTheme: FaceTheme = .classic
+    @State private var showAppearance = false
     @GestureState private var isTouching = false
 
     var body: some View {
         GeometryReader { geo in
             let metrics = metrics(in: geo.size)
             ZStack(alignment: .topLeading) {
-                FeltBackground().ignoresSafeArea()
+                FeltBackground(theme: tableTheme).ignoresSafeArea()
 
                 VStack(spacing: 0) {
                     header
@@ -77,7 +81,7 @@ struct ContentView: View {
                     .simultaneousGesture(doubleTap(metrics: metrics))
                     .simultaneousGesture(stockTap())
                 }
-                .padding(.horizontal, 8)
+                .padding(.horizontal, 5)
                 .padding(.top, 6)
                 .padding(.bottom, 10)
 
@@ -130,8 +134,12 @@ struct ContentView: View {
             }
         }
         .preferredColorScheme(.dark)
+        .environment(\.cardStyle, CardStyle(back: cardBackTheme, face: faceTheme))
         .sheet(isPresented: $showScores) {
             ScoresView(store: scores)
+        }
+        .sheet(isPresented: $showAppearance) {
+            AppearanceView(table: $tableTheme, back: $cardBackTheme, face: $faceTheme, leftHanded: $leftHanded)
         }
         .confirmationDialog("Start a new game?", isPresented: $confirmNewGame, titleVisibility: .visible) {
             Button("New Game", role: .destructive) { startNewGame() }
@@ -218,9 +226,13 @@ struct ContentView: View {
         }
 
         if let drag = activeDrag {
+            let peek: CGFloat = {
+                if case .tableau(let column) = drag.source { return metrics.peeks(for: game.tableau[column]).face }
+                return metrics.facePeek
+            }()
             for (k, card) in drag.cards.enumerated() {
                 guard let idx = result.firstIndex(where: { $0.card.id == card.id }) else { continue }
-                result[idx].origin = CGPoint(x: drag.location.x, y: drag.location.y + CGFloat(k) * metrics.facePeek)
+                result[idx].origin = CGPoint(x: drag.location.x, y: drag.location.y + CGFloat(k) * peek)
                 result[idx].z = 1_000_000 + Double(k)
                 result[idx].lifted = true
             }
@@ -277,8 +289,11 @@ struct ContentView: View {
 
     // MARK: - Header
 
+    /// Narrow screens (a phone held upright) get icon-only buttons so nothing wraps.
+    private var compactHeader: Bool { boardSize.width < 560 }
+
     private var header: some View {
-        HStack(spacing: 8) {
+        HStack(spacing: compactHeader ? 6 : 8) {
             headerButton("New", systemImage: "arrow.counterclockwise") {
                 if game.moves == 0 || game.isWon {
                     startNewGame()
@@ -297,20 +312,29 @@ struct ContentView: View {
                 Button {
                     Task { await runAutoFinish() }
                 } label: {
-                    Label("Finish", systemImage: "sparkles")
-                        .font(.subheadline.weight(.bold))
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 7)
-                        .background(Felt.gold.gradient, in: Capsule())
-                        .foregroundStyle(.black)
-                        .shadow(color: Felt.gold.opacity(0.5), radius: 6)
+                    Group {
+                        if compactHeader {
+                            Image(systemName: "sparkles")
+                                .frame(width: 36, height: 36)
+                                .background(Felt.gold.gradient, in: Circle())
+                        } else {
+                            Label("Finish", systemImage: "sparkles")
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 7)
+                                .background(Felt.gold.gradient, in: Capsule())
+                        }
+                    }
+                    .font(.subheadline.weight(.bold))
+                    .foregroundStyle(.black)
+                    .shadow(color: Felt.gold.opacity(0.5), radius: 6)
                 }
                 .buttonStyle(PressableStyle())
                 .disabled(isAutoFinishing)
+                .accessibilityLabel("Finish")
                 .transition(.scale.combined(with: .opacity))
             }
 
-            Spacer(minLength: 8)
+            Spacer(minLength: 4)
 
             statsCapsule
 
@@ -331,6 +355,11 @@ struct ContentView: View {
                     Button("Draw 1") { startNewGame(drawCount: 1) }
                     Button("Draw 3") { startNewGame(drawCount: 3) }
                 }
+                Button {
+                    showAppearance = true
+                } label: {
+                    Label("Appearance…", systemImage: "paintpalette")
+                }
                 Toggle("Left-Handed Layout", isOn: $leftHanded)
             } label: {
                 Image(systemName: "ellipsis")
@@ -342,6 +371,7 @@ struct ContentView: View {
             .accessibilityLabel("Game options")
         }
         .padding(.horizontal, 4)
+        .frame(height: 40)
         .animation(.cardSnap, value: game.canAutoFinish)
     }
 
@@ -349,28 +379,40 @@ struct ContentView: View {
 
     private func headerButton(_ title: String, systemImage: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
-            Label(title, systemImage: systemImage)
-                .font(.subheadline.weight(.semibold))
-                .foregroundStyle(Felt.cream)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 7)
-                .background(.ultraThinMaterial, in: Capsule())
+            Group {
+                if compactHeader {
+                    Image(systemName: systemImage)
+                        .frame(width: 36, height: 36)
+                        .background(.ultraThinMaterial, in: Circle())
+                } else {
+                    Label(title, systemImage: systemImage)
+                        .lineLimit(1)
+                        .fixedSize()
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 7)
+                        .background(.ultraThinMaterial, in: Capsule())
+                }
+            }
+            .font(.subheadline.weight(.semibold))
+            .foregroundStyle(Felt.cream)
         }
         .buttonStyle(PressableStyle())
+        .accessibilityLabel(title)
     }
 
     private var statsCapsule: some View {
         TimelineView(.periodic(from: .now, by: 1)) { _ in
-            HStack(spacing: 10) {
+            HStack(spacing: compactHeader ? 8 : 10) {
                 labeledStat("Score", value: "\(game.currentScore)")
                 divider
                 labeledStat("Time", value: game.elapsed.clockString)
                 divider
                 labeledStat("Moves", value: "\(game.moves)")
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 6)
+            .padding(.horizontal, compactHeader ? 10 : 12)
+            .padding(.vertical, 5)
             .background(.ultraThinMaterial, in: Capsule())
+            .fixedSize()
         }
     }
 
@@ -384,6 +426,7 @@ struct ContentView: View {
         VStack(spacing: 0) {
             Text(title.uppercased())
                 .font(.system(size: 8, weight: .semibold))
+                .lineLimit(1)
                 .foregroundStyle(Felt.cream.opacity(0.55))
             Text(value)
                 .font(.subheadline.weight(.bold).monospacedDigit())
@@ -724,16 +767,21 @@ struct ContentView: View {
 
     private func metrics(in size: CGSize) -> CardSize {
         let spacing: CGFloat = 4
-        let width = (size.width - 16 - spacing * 6) / 7
+        let width = (size.width - 10 - spacing * 6) / 7
         let height = width * 1.46
-        let tableauHeight = max(160, size.height - 72 - height - 28)
-        let backPeek = max(14, min(18, height * 0.18))
-        let indexBand = width * 0.50 + 4
-        let facePeek = min(
-            height * 0.56,
-            max(indexBand, (tableauHeight - height - backPeek * 6) / 9)
+        // Everything above the tableau: top padding, header, gap, top row, row spacing, bottom padding.
+        let tableauHeight = max(height * 2, size.height - 6 - 40 - 8 - height - 22 - 12)
+        let indexBand = width * 0.50 * faceTheme.indexScale + 4
+        return CardSize(
+            width: width,
+            height: height,
+            facePeek: max(indexBand, height * 0.52),
+            backPeek: max(10, height * 0.27),
+            spacing: spacing,
+            minFacePeek: indexBand,
+            minBackPeek: max(5, height * 0.07),
+            tableauHeight: tableauHeight
         )
-        return CardSize(width: width, height: height, facePeek: facePeek, backPeek: backPeek, spacing: spacing)
     }
 }
 
@@ -800,13 +848,12 @@ private struct PileSlots: View, Equatable {
 }
 
 private struct FeltBackground: View {
+    var theme: TableTheme
+
     var body: some View {
         ZStack {
-            LinearGradient(
-                colors: [Color(red: 0.09, green: 0.42, blue: 0.27), Felt.green, Felt.greenDeep],
-                startPoint: .top,
-                endPoint: .bottom
-            )
+            LinearGradient(colors: theme.colors, startPoint: .top, endPoint: .bottom)
+                .animation(.easeInOut(duration: 0.35), value: theme)
             RadialGradient(
                 colors: [Color.white.opacity(0.14), .clear],
                 center: UnitPoint(x: 0.5, y: 0.25),

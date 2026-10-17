@@ -7,8 +7,6 @@ enum Felt {
     static let cream = Color(red: 0.97, green: 0.94, blue: 0.86)
     static let red = Color(red: 0.80, green: 0.10, blue: 0.16)
     static let ink = Color(red: 0.09, green: 0.09, blue: 0.12)
-    static let backTop = Color(red: 0.60, green: 0.09, blue: 0.16)
-    static let backBottom = Color(red: 0.32, green: 0.03, blue: 0.08)
 }
 
 extension Animation {
@@ -31,18 +29,48 @@ extension Suit {
 struct CardSize: Equatable {
     var width: CGFloat
     var height: CGFloat
+    /// Comfortable gaps between stacked cards, used while a column has room.
     var facePeek: CGFloat
     var backPeek: CGFloat
     var spacing: CGFloat
+    /// The tightest the gaps may get when a long column has to squeeze in.
+    var minFacePeek: CGFloat = 0
+    var minBackPeek: CGFloat = 0
+    /// Vertical room for a tableau column, top of first card to bottom of last.
+    var tableauHeight: CGFloat = .infinity
     var corner: CGFloat { max(7, width * 0.11) }
     var fanStep: CGFloat { width * 0.42 }
 
+    /// Gaps for one column: the comfortable ones when it fits, otherwise squeezed
+    /// (face-down cards first, since nobody needs to read them).
+    func peeks(for cards: [Card]) -> (face: CGFloat, back: CGFloat) {
+        guard cards.count > 1, tableauHeight.isFinite else { return (facePeek, backPeek) }
+        var faces = 0
+        var backs = 0
+        for card in cards.dropLast() {
+            if card.isFaceUp { faces += 1 } else { backs += 1 }
+        }
+        let budget = tableauHeight - height
+        let natural = CGFloat(faces) * facePeek + CGFloat(backs) * backPeek
+        guard natural > budget, budget > 0 else { return (facePeek, backPeek) }
+
+        let overflow = natural - budget
+        let backSlack = CGFloat(backs) * max(0, backPeek - minBackPeek)
+        if overflow <= backSlack {
+            return (facePeek, backPeek - overflow / CGFloat(max(backs, 1)))
+        }
+        let remaining = overflow - backSlack
+        let face = max(minFacePeek, facePeek - remaining / CGFloat(max(faces, 1)))
+        return (face, min(backPeek, minBackPeek))
+    }
+
     func stackOffset(at index: Int, in cards: [Card]) -> CGFloat {
         guard index > 0, !cards.isEmpty else { return 0 }
+        let (face, back) = peeks(for: cards)
         let end = min(index, cards.count)
         var y: CGFloat = 0
         for i in 0..<end {
-            y += cards[i].isFaceUp ? facePeek : backPeek
+            y += cards[i].isFaceUp ? face : back
         }
         return y
     }
@@ -55,7 +83,8 @@ struct CardSize: Equatable {
     func exposedPeek(at index: Int, in cards: [Card]) -> CGFloat {
         guard cards.indices.contains(index) else { return facePeek }
         if index == cards.count - 1 { return height }
-        return cards[index].isFaceUp ? facePeek : backPeek
+        let (face, back) = peeks(for: cards)
+        return cards[index].isFaceUp ? face : back
     }
 }
 
@@ -109,12 +138,13 @@ private struct FlipContainer<Front: View, Back: View>: View, Animatable {
     }
 }
 
-private struct CardFace: View, Equatable {
+private struct CardFace: View {
     let suit: Suit
     let rank: Rank
     let size: CardSize
+    @Environment(\.cardStyle) private var style
 
-    private var ink: Color { suit.isRed ? Felt.red : Felt.ink }
+    private var ink: Color { style.face.ink(for: suit) }
     private var isCourt: Bool { rank == .jack || rank == .queen || rank == .king }
 
     var body: some View {
@@ -155,12 +185,12 @@ private struct CardFace: View, Equatable {
     private var cornerIndex: some View {
         HStack(alignment: .firstTextBaseline, spacing: size.width * 0.03) {
             Text(rank.display)
-                .font(.system(size: size.width * (rank == .ten ? 0.30 : 0.34), weight: .bold, design: .rounded))
+                .font(.system(size: size.width * (rank == .ten ? 0.30 : 0.34) * style.face.indexScale, weight: .bold, design: .rounded))
                 .tracking(rank == .ten ? -1.2 : 0)
                 .lineLimit(1)
                 .fixedSize()
             Image(systemName: suit.sfSymbol)
-                .font(.system(size: size.width * 0.22, weight: .bold))
+                .font(.system(size: size.width * 0.22 * style.face.indexScale, weight: .bold))
         }
     }
 
@@ -200,8 +230,9 @@ private struct CardFace: View, Equatable {
     }
 }
 
-private struct CardBack: View, Equatable {
+private struct CardBack: View {
     let size: CardSize
+    @Environment(\.cardStyle) private var style
 
     var body: some View {
         let shape = RoundedRectangle(cornerRadius: size.corner, style: .continuous)
@@ -211,26 +242,25 @@ private struct CardBack: View, Equatable {
             shape.fill(Color(white: 0.98))
             RoundedRectangle(cornerRadius: innerCorner, style: .continuous)
                 .fill(
-                    LinearGradient(colors: [Felt.backTop, Felt.backBottom], startPoint: .topLeading, endPoint: .bottomTrailing)
+                    LinearGradient(colors: [style.back.top, style.back.bottom], startPoint: .topLeading, endPoint: .bottomTrailing)
                 )
                 .overlay {
-                    LatticePattern(spacing: max(5, size.width * 0.11))
-                        .stroke(Color.white.opacity(0.13), lineWidth: 0.8)
+                    pattern
                         .clipShape(RoundedRectangle(cornerRadius: innerCorner, style: .continuous))
                 }
                 .overlay {
                     RoundedRectangle(cornerRadius: max(2, innerCorner - 2), style: .continuous)
-                        .strokeBorder(Felt.gold.opacity(0.75), lineWidth: max(0.8, size.width * 0.014))
+                        .strokeBorder(style.back.accent.opacity(0.75), lineWidth: max(0.8, size.width * 0.014))
                         .padding(max(2, size.width * 0.045))
                 }
                 .overlay {
                     ZStack {
                         Circle()
-                            .fill(Felt.backBottom)
-                            .overlay(Circle().strokeBorder(Felt.gold.opacity(0.85), lineWidth: max(0.8, size.width * 0.015)))
+                            .fill(style.back.bottom)
+                            .overlay(Circle().strokeBorder(style.back.accent.opacity(0.85), lineWidth: max(0.8, size.width * 0.015)))
                         Image(systemName: "suit.spade.fill")
                             .font(.system(size: size.width * 0.18))
-                            .foregroundStyle(Felt.gold)
+                            .foregroundStyle(style.back.accent)
                     }
                     .frame(width: size.width * 0.38, height: size.width * 0.38)
                 }
@@ -247,6 +277,57 @@ private struct CardBack: View, Equatable {
         }
         .clipShape(shape)
         .compositingGroup()
+    }
+
+    @ViewBuilder
+    private var pattern: some View {
+        let spacing = max(5, size.width * 0.11)
+        switch style.back.pattern {
+        case .lattice:
+            LatticePattern(spacing: spacing).stroke(Color.white.opacity(0.13), lineWidth: 0.8)
+        case .stripes:
+            StripePattern(spacing: spacing * 0.8).stroke(Color.white.opacity(0.16), lineWidth: spacing * 0.28)
+        case .dots:
+            DotPattern(spacing: spacing, radius: spacing * 0.16).fill(Color.white.opacity(0.18))
+        case .plain:
+            Color.clear
+        }
+    }
+}
+
+private struct StripePattern: Shape {
+    var spacing: CGFloat
+
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+        var d: CGFloat = -rect.height
+        while d < rect.width {
+            path.move(to: CGPoint(x: rect.minX + d, y: rect.maxY))
+            path.addLine(to: CGPoint(x: rect.minX + d + rect.height, y: rect.minY))
+            d += spacing
+        }
+        return path
+    }
+}
+
+private struct DotPattern: Shape {
+    var spacing: CGFloat
+    var radius: CGFloat
+
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+        var row = 0
+        var y = rect.minY + spacing / 2
+        while y < rect.maxY {
+            var x = rect.minX + (row.isMultiple(of: 2) ? spacing / 2 : spacing)
+            while x < rect.maxX {
+                path.addEllipse(in: CGRect(x: x - radius, y: y - radius, width: radius * 2, height: radius * 2))
+                x += spacing
+            }
+            y += spacing * 0.75
+            row += 1
+        }
+        return path
     }
 }
 
