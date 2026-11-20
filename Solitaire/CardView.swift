@@ -33,16 +33,29 @@ struct CardSize: Equatable {
     var facePeek: CGFloat
     var backPeek: CGFloat
     var spacing: CGFloat
-    /// The tightest the gaps may get when a long column has to squeeze in.
+    /// The gaps a long column squeezes to while the whole corner index stays readable.
     var minFacePeek: CGFloat = 0
     var minBackPeek: CGFloat = 0
+    /// Last-resort face-up gap for a very long column: enough to read the rank.
+    var tightFacePeek: CGFloat = 0
     /// Vertical room for a tableau column, top of first card to bottom of last.
     var tableauHeight: CGFloat = .infinity
+    /// Landscape layout: the foundations and the stock sit in rails either side of the tableau.
+    var sideRails = false
+    /// Extra room between a side rail and the tableau.
+    var railGap: CGFloat = 0
     var corner: CGFloat { max(7, width * 0.11) }
     var fanStep: CGFloat { width * 0.42 }
+    /// Gap between the stock and the waste in the top row. Scales with the cards, and stays
+    /// small enough that a fanned draw-3 waste still fits beside four foundations.
+    var stockGap: CGFloat { spacing + min(12, width * 0.1) }
+    /// Spacing between piles stacked in a side rail.
+    var railSpacing: CGFloat { spacing * 2 }
+    /// How far each card of a draw-3 waste fans downward in a side rail.
+    var railFanStep: CGFloat { max(minFacePeek, height * 0.28) }
 
-    /// Gaps for one column: the comfortable ones when it fits, otherwise squeezed
-    /// (face-down cards first, since nobody needs to read them).
+    /// Gaps for one column: the comfortable ones when it fits, otherwise squeezed until the
+    /// column fits on the board, so no card is ever pushed off the bottom of the screen.
     func peeks(for cards: [Card]) -> (face: CGFloat, back: CGFloat) {
         guard cards.count > 1, tableauHeight.isFinite else { return (facePeek, backPeek) }
         var faces = 0
@@ -50,18 +63,24 @@ struct CardSize: Equatable {
         for card in cards.dropLast() {
             if card.isFaceUp { faces += 1 } else { backs += 1 }
         }
-        let budget = tableauHeight - height
-        let natural = CGFloat(faces) * facePeek + CGFloat(backs) * backPeek
-        guard natural > budget, budget > 0 else { return (facePeek, backPeek) }
+        let budget = max(0, tableauHeight - height)
+        var face = facePeek
+        var back = backPeek
 
-        let overflow = natural - budget
-        let backSlack = CGFloat(backs) * max(0, backPeek - minBackPeek)
-        if overflow <= backSlack {
-            return (facePeek, backPeek - overflow / CGFloat(max(backs, 1)))
+        func overflow() -> CGFloat { CGFloat(faces) * face + CGFloat(backs) * back - budget }
+        func squeezed(_ value: CGFloat, count: Int, floor: CGFloat) -> CGFloat {
+            let over = overflow()
+            guard over > 0, count > 0 else { return value }
+            return max(min(floor, value), value - over / CGFloat(count))
         }
-        let remaining = overflow - backSlack
-        let face = max(minFacePeek, facePeek - remaining / CGFloat(max(faces, 1)))
-        return (face, min(backPeek, minBackPeek))
+
+        // Give up what is least needed first: face-down gaps, then face-up gaps down to the
+        // corner index, then face-down cards to a sliver, then face-up gaps down to the rank.
+        back = squeezed(back, count: backs, floor: minBackPeek)
+        face = squeezed(face, count: faces, floor: minFacePeek)
+        back = squeezed(back, count: backs, floor: min(minBackPeek, 3))
+        face = squeezed(face, count: faces, floor: tightFacePeek)
+        return (face, back)
     }
 
     func stackOffset(at index: Int, in cards: [Card]) -> CGFloat {
@@ -150,13 +169,7 @@ private struct CardFace: View {
     var body: some View {
         let shape = RoundedRectangle(cornerRadius: size.corner, style: .continuous)
         ZStack {
-            shape.fill(
-                LinearGradient(
-                    colors: [Color(white: 1.0), Color(red: 0.965, green: 0.955, blue: 0.93)],
-                    startPoint: .top,
-                    endPoint: .bottom
-                )
-            )
+            shape.fill(LinearGradient(colors: style.face.paper, startPoint: .top, endPoint: .bottom))
 
             center
                 .padding(.top, size.height * 0.30)
@@ -169,11 +182,7 @@ private struct CardFace: View {
                 .padding(.top, size.width * 0.05)
 
             shape.strokeBorder(
-                LinearGradient(
-                    colors: [Color.white, Color.black.opacity(0.16)],
-                    startPoint: .top,
-                    endPoint: .bottom
-                ),
+                LinearGradient(colors: style.face.edge, startPoint: .top, endPoint: .bottom),
                 lineWidth: 0.8
             )
         }
@@ -201,7 +210,7 @@ private struct CardFace: View {
             ZStack {
                 inset.fill(
                     LinearGradient(
-                        colors: [ink.opacity(0.10), ink.opacity(0.03)],
+                        colors: [ink.opacity(style.face.isDark ? 0.18 : 0.10), ink.opacity(style.face.isDark ? 0.06 : 0.03)],
                         startPoint: .top,
                         endPoint: .bottom
                     )
@@ -224,7 +233,7 @@ private struct CardFace: View {
                 .resizable()
                 .scaledToFit()
                 .frame(maxWidth: size.width * (rank == .ace ? 0.56 : 0.46))
-                .shadow(color: ink.opacity(0.25), radius: 1, y: 1)
+                .shadow(color: ink.opacity(style.face == .neon ? 0.7 : 0.25), radius: style.face == .neon ? 3 : 1, y: style.face == .neon ? 0 : 1)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
     }
@@ -291,7 +300,126 @@ private struct CardBack: View {
             DotPattern(spacing: spacing, radius: spacing * 0.16).fill(Color.white.opacity(0.18))
         case .plain:
             Color.clear
+        case .argyle:
+            ZStack {
+                ArgylePattern(spacing: spacing * 1.5).fill(Color.white.opacity(0.11))
+                ArgyleStitch(spacing: spacing * 1.5).stroke(style.back.accent.opacity(0.30), lineWidth: 0.6)
+            }
+        case .sunburst:
+            SunburstPattern(rays: 14).fill(Color.white.opacity(0.13))
+        case .chevrons:
+            ChevronPattern(spacing: spacing * 0.9, period: spacing * 2.2)
+                .stroke(Color.white.opacity(0.15), lineWidth: spacing * 0.22)
+        case .rings:
+            RingPattern(spacing: spacing * 0.75).stroke(Color.white.opacity(0.14), lineWidth: spacing * 0.18)
         }
+    }
+}
+
+/// Upright diamonds in a checkerboard, each `spacing` wide and half again as tall.
+private struct ArgylePattern: Shape {
+    var spacing: CGFloat
+
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+        let w = spacing * 2
+        let h = spacing * 3
+        // Centered so the pattern is symmetric around the medallion.
+        let columns = Int(ceil(rect.width / w / 2)) + 1
+        let rows = Int(ceil(rect.height / h / 2)) + 1
+        for row in -rows...rows {
+            for column in -columns...columns {
+                let center = CGPoint(x: rect.midX + CGFloat(column) * w, y: rect.midY + CGFloat(row) * h)
+                path.move(to: CGPoint(x: center.x, y: center.y - h / 2))
+                path.addLine(to: CGPoint(x: center.x + w / 2, y: center.y))
+                path.addLine(to: CGPoint(x: center.x, y: center.y + h / 2))
+                path.addLine(to: CGPoint(x: center.x - w / 2, y: center.y))
+                path.closeSubpath()
+            }
+        }
+        return path
+    }
+}
+
+/// Thin crossing lines through the middle of every argyle diamond.
+private struct ArgyleStitch: Shape {
+    var spacing: CGFloat
+
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+        let w = spacing * 2
+        let slope: CGFloat = 1.5
+        let reach = rect.height / 2
+        let count = Int(ceil((rect.width / 2 + reach / slope) / w)) + 1
+        for k in -count...count {
+            let x = rect.midX + CGFloat(k) * w
+            path.move(to: CGPoint(x: x - reach / slope, y: rect.minY))
+            path.addLine(to: CGPoint(x: x + reach / slope, y: rect.maxY))
+            path.move(to: CGPoint(x: x + reach / slope, y: rect.minY))
+            path.addLine(to: CGPoint(x: x - reach / slope, y: rect.maxY))
+        }
+        return path
+    }
+}
+
+/// Alternating wedges fanning out from the center.
+private struct SunburstPattern: Shape {
+    var rays: Int
+
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+        let center = CGPoint(x: rect.midX, y: rect.midY)
+        let radius = hypot(rect.width, rect.height)
+        let step = Double.pi / Double(rays)
+        for i in 0..<rays {
+            let start = Double(i) * step * 2
+            path.move(to: center)
+            path.addLine(to: CGPoint(x: center.x + radius * cos(start), y: center.y + radius * sin(start)))
+            path.addLine(to: CGPoint(x: center.x + radius * cos(start + step), y: center.y + radius * sin(start + step)))
+            path.closeSubpath()
+        }
+        return path
+    }
+}
+
+/// Zigzag rows running across the card.
+private struct ChevronPattern: Shape {
+    var spacing: CGFloat
+    var period: CGFloat
+
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+        let rise = period / 2 * 0.7
+        var y = rect.minY - rise
+        while y < rect.maxY + rise {
+            // Start from the center line so the points line up with the medallion.
+            var x = rect.midX - ceil(rect.width / period) * period
+            var up = false
+            path.move(to: CGPoint(x: x, y: y + rise))
+            while x < rect.maxX + period {
+                x += period / 2
+                path.addLine(to: CGPoint(x: x, y: up ? y + rise : y))
+                up.toggle()
+            }
+            y += spacing
+        }
+        return path
+    }
+}
+
+/// Concentric circles around the center.
+private struct RingPattern: Shape {
+    var spacing: CGFloat
+
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+        let reach = hypot(rect.width, rect.height) / 2
+        var radius = spacing
+        while radius < reach {
+            path.addEllipse(in: CGRect(x: rect.midX - radius, y: rect.midY - radius, width: radius * 2, height: radius * 2))
+            radius += spacing
+        }
+        return path
     }
 }
 

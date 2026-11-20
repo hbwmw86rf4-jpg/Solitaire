@@ -14,12 +14,26 @@ private struct ActiveDrag: Equatable {
     var sourceIndex: Int
     var grabOffset: CGSize
     var location: CGPoint
+    /// Degrees the held stack leans while it is swung across the table.
+    var tilt: Double = 0
 }
 
 private struct ScoreBurst: Identifiable, Equatable {
     let id = UUID()
     var text: String
     var point: CGPoint
+}
+
+private struct Ripple: Identifiable {
+    let id = UUID()
+    var frame: CGRect
+    var strong: Bool
+}
+
+private struct Sparks: Identifiable {
+    let id = UUID()
+    var point: CGPoint
+    var scale: CGFloat
 }
 
 /// Where a single card is drawn on the board. Every card lives in one layer,
@@ -53,6 +67,23 @@ struct ContentView: View {
     @State private var flightSeq = 0
     @State private var recordedWinID: UUID?
     @State private var bursts: [ScoreBurst] = []
+    @State private var ripples: [Ripple] = []
+    @State private var sparks: [Sparks] = []
+    @State private var confettiID: UUID?
+    /// Per-card counters; bumping one plays that card's bounce or shake.
+    @State private var pops: [UUID: Int] = [:]
+    @State private var shakes: [UUID: Int] = [:]
+    @State private var tiltSettleSeq = 0
+    @State private var newGameTaps = 0
+    @State private var undoTaps = 0
+    @State private var hintTaps = 0
+    /// The suggestion being pointed out on the board, and the line of text that goes with it.
+    @State private var hint: Hint?
+    @State private var hintMessage: String?
+    /// Which of the position's suggestions is showing; asking again steps to the next one.
+    @State private var hintIndex = 0
+    @State private var hintSeq = 0
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @AppStorage("leftHandedLayout") private var leftHanded = false
     @AppStorage("tableTheme") private var tableTheme: TableTheme = .green
     @AppStorage("cardBackTheme") private var cardBackTheme: CardBackTheme = .crimson
@@ -86,9 +117,7 @@ struct ContentView: View {
                 .padding(.bottom, 10)
 
                 if let pile = hoverPile(), let frame = pileFrames[pile] {
-                    RoundedRectangle(cornerRadius: metrics.corner, style: .continuous)
-                        .strokeBorder(Felt.gold, lineWidth: 2.5)
-                        .shadow(color: Felt.gold.opacity(0.8), radius: 8)
+                    TargetGlow(corner: metrics.corner)
                         .frame(width: frame.width, height: min(frame.height, metrics.height + 8))
                         .offset(x: frame.minX, y: frame.minY)
                         .allowsHitTesting(false)
@@ -97,10 +126,41 @@ struct ContentView: View {
 
                 cardLayer(metrics: metrics)
 
+                if let hint, let frames = hintFrames(hint, metrics: metrics) {
+                    HintHighlight(source: frames.source, landing: frames.landing, corner: metrics.corner, reduceMotion: reduceMotion)
+                        .id(hintSeq)
+                        .transition(.opacity)
+                }
+
+                ForEach(ripples) { ripple in
+                    LandingRipple(size: ripple.frame.size, corner: metrics.corner, strong: ripple.strong)
+                        .position(x: ripple.frame.midX, y: ripple.frame.midY)
+                        .allowsHitTesting(false)
+                }
+
+                ForEach(sparks) { spark in
+                    ParticleBurst(style: .sparks(at: spark.point, scale: spark.scale))
+                        .frame(width: geo.size.width, height: geo.size.height)
+                }
+
                 ForEach(bursts) { burst in
                     BurstLabel(text: burst.text)
                         .position(burst.point)
                         .allowsHitTesting(false)
+                }
+
+                if let hintMessage {
+                    HintToast(text: hintMessage, found: hint != nil)
+                        .frame(maxWidth: min(geo.size.width - 32, 420))
+                        .frame(width: geo.size.width, height: geo.size.height - 14, alignment: .bottom)
+                        .allowsHitTesting(false)
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                }
+
+                if let confettiID {
+                    ParticleBurst(style: .confetti)
+                        .frame(width: geo.size.width, height: geo.size.height)
+                        .id(confettiID)
                 }
 
                 if showWinPanel {
@@ -146,6 +206,8 @@ struct ContentView: View {
             Button("Cancel", role: .cancel) {}
         }
         .sensoryFeedback(.success, trigger: game.isWon)
+        // Any move, draw or undo changes the count, and makes the suggestion on screen stale.
+        .onChange(of: game.moves) { clearHint() }
         .onChange(of: game.isWon) { _, won in
             guard won else { return }
             recordWinIfNeeded()
@@ -160,6 +222,7 @@ struct ContentView: View {
         return ZStack(alignment: .topLeading) {
             ForEach(Array(placements.enumerated()), id: \.element.card.id) { order, p in
                 CardView(card: p.card, size: metrics, faceUp: p.faceUp, lifted: p.lifted)
+                    .modifier(CardReactions(pop: pops[p.card.id] ?? 0, shake: shakes[p.card.id] ?? 0))
                     .rotationEffect(.degrees(p.rotation))
                     .offset(x: p.origin.x, y: p.origin.y)
                     .zIndex(p.z)
@@ -230,9 +293,16 @@ struct ContentView: View {
                 if case .tableau(let column) = drag.source { return metrics.peeks(for: game.tableau[column]).face }
                 return metrics.facePeek
             }()
+            // The held stack leans as one piece, pivoting on its top card.
+            let lean = drag.tilt * .pi / 180
             for (k, card) in drag.cards.enumerated() {
                 guard let idx = result.firstIndex(where: { $0.card.id == card.id }) else { continue }
-                result[idx].origin = CGPoint(x: drag.location.x, y: drag.location.y + CGFloat(k) * peek)
+                let reach = CGFloat(k) * peek
+                result[idx].origin = CGPoint(
+                    x: drag.location.x - reach * CGFloat(sin(lean)),
+                    y: drag.location.y + reach * CGFloat(cos(lean))
+                )
+                result[idx].rotation = drag.tilt
                 result[idx].z = 1_000_000 + Double(k)
                 result[idx].lifted = true
             }
@@ -258,6 +328,11 @@ struct ContentView: View {
     /// `fanSlot` counts from the top card (0) down into the fan.
     private func wasteOrigin(fanSlot: Int, visible: Int, metrics: CardSize) -> CGPoint {
         guard let frame = pileFrames[.waste] else { return .zero }
+        if metrics.sideRails {
+            // In a side rail the fan runs downward, the playable card lowest.
+            let position = max(0, visible - 1 - fanSlot)
+            return CGPoint(x: frame.minX, y: frame.minY + CGFloat(position) * metrics.railFanStep)
+        }
         if leftHanded {
             let position = max(0, visible - 1 - fanSlot)
             return CGPoint(x: frame.minX + CGFloat(position) * metrics.fanStep, y: frame.minY)
@@ -294,19 +369,40 @@ struct ContentView: View {
 
     private var header: some View {
         HStack(spacing: compactHeader ? 6 : 8) {
-            headerButton("New", systemImage: "arrow.counterclockwise") {
+            headerButton("New") {
+                newGameTaps += 1
                 if game.moves == 0 || game.isWon {
                     startNewGame()
                 } else {
                     confirmNewGame = true
                 }
+            } icon: {
+                Image(systemName: "arrow.counterclockwise")
+                    .symbolEffect(.rotate.counterClockwise, value: newGameTaps)
             }
 
-            headerButton("Undo", systemImage: "arrow.uturn.backward") {
+            headerButton("Undo") {
+                undoTaps += 1
                 animated { game.undo() }
+            } icon: {
+                Image(systemName: "arrow.uturn.backward")
+                    .symbolEffect(.wiggle.backward, value: undoTaps)
             }
             .disabled(!game.canUndo || isBusy)
             .opacity(game.canUndo && !isBusy ? 1 : 0.38)
+
+            // Once the game can finish itself the Finish button is the hint, and takes this spot.
+            if !game.canAutoFinish {
+                headerButton("Hint") {
+                    showHint()
+                } icon: {
+                    Image(systemName: "lightbulb.fill")
+                        .symbolEffect(.bounce, value: hintTaps)
+                }
+                .disabled(isBusy || game.isWon)
+                .opacity(isBusy || game.isWon ? 0.38 : 1)
+                .accessibilityHint("Points out a move worth making")
+            }
 
             if game.canAutoFinish && !game.isWon {
                 Button {
@@ -324,6 +420,7 @@ struct ContentView: View {
                                 .background(Felt.gold.gradient, in: Capsule())
                         }
                     }
+                    .symbolEffect(.breathe, isActive: !isAutoFinishing)
                     .font(.subheadline.weight(.bold))
                     .foregroundStyle(.black)
                     .shadow(color: Felt.gold.opacity(0.5), radius: 6)
@@ -342,6 +439,7 @@ struct ContentView: View {
                 showScores = true
             } label: {
                 Image(systemName: "trophy.fill")
+                    .symbolEffect(.bounce, value: recordedWinID)
                     .font(.body.weight(.semibold))
                     .foregroundStyle(Felt.gold)
                     .frame(width: 36, height: 36)
@@ -377,15 +475,20 @@ struct ContentView: View {
 
     private var isBusy: Bool { isAutoFinishing || isDealing }
 
-    private func headerButton(_ title: String, systemImage: String, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
+    private func headerButton<Icon: View>(
+        _ title: String,
+        action: @escaping () -> Void,
+        @ViewBuilder icon: () -> Icon
+    ) -> some View {
+        let icon = icon()
+        return Button(action: action) {
             Group {
                 if compactHeader {
-                    Image(systemName: systemImage)
+                    icon
                         .frame(width: 36, height: 36)
                         .background(.ultraThinMaterial, in: Circle())
                 } else {
-                    Label(title, systemImage: systemImage)
+                    Label { Text(title) } icon: { icon }
                         .lineLimit(1)
                         .fixedSize()
                         .padding(.horizontal, 12)
@@ -488,6 +591,14 @@ struct ContentView: View {
         try? await Task.sleep(for: .milliseconds(450))
         guard game.isWon else { return }
         celebrating = true
+        if !reduceMotion {
+            let id = UUID()
+            confettiID = id
+            Task {
+                try? await Task.sleep(for: .seconds(ParticleBurst.confettiDuration))
+                if confettiID == id { confettiID = nil }
+            }
+        }
         try? await Task.sleep(for: .milliseconds(900))
         guard game.isWon else { return }
         withAnimation(.cardSnap) { showWinPanel = true }
@@ -503,6 +614,7 @@ struct ContentView: View {
                 if activeDrag == nil {
                     guard let pick = pickCard(at: value.startLocation, metrics: metrics) else { return }
                     guard let cards = game.cards(from: pick.pile, startingAt: pick.index) else { return }
+                    clearHint()
                     let origin = cardOrigin(pile: pick.pile, index: pick.index, metrics: metrics)
                     let grab = CGSize(width: value.startLocation.x - origin.x, height: value.startLocation.y - origin.y)
                     // Pick up with a quick spring so the stack visibly lifts under the finger.
@@ -521,14 +633,31 @@ struct ContentView: View {
                         x: value.location.x - drag.grabOffset.width,
                         y: value.location.y - drag.grabOffset.height
                     )
+                    if !reduceMotion {
+                        // Lean into the swing like a card held by its top edge, smoothed so it doesn't jitter.
+                        let lean = max(-10, min(10, Double(value.velocity.width) / 130))
+                        drag.tilt += (lean - drag.tilt) * 0.3
+                    }
                     var transaction = Transaction()
                     transaction.disablesAnimations = true
                     withTransaction(transaction) { activeDrag = drag }
+                    settleTiltWhenStill()
                 }
             }
             .onEnded { value in
                 finishDrag(at: value.location, metrics: metrics)
             }
+    }
+
+    /// A finger that stops moving sends no more drag events, so straighten the stack after a pause.
+    private func settleTiltWhenStill() {
+        tiltSettleSeq &+= 1
+        let seq = tiltSettleSeq
+        Task {
+            try? await Task.sleep(for: .milliseconds(80))
+            guard seq == tiltSettleSeq, let tilt = activeDrag?.tilt, tilt != 0 else { return }
+            withAnimation(.cardSnap) { activeDrag?.tilt = 0 }
+        }
     }
 
     private func stockTap() -> some Gesture {
@@ -555,7 +684,11 @@ struct ContentView: View {
                     }
                     return 1
                 }()
-                guard let dest = game.suggestedMove(from: pick.pile, count: count) else { return }
+                guard let dest = game.suggestedMove(from: pick.pile, count: count) else {
+                    UIImpactFeedbackGenerator(style: .rigid).impactOccurred(intensity: 0.5)
+                    shake(game.cards(from: pick.pile, startingAt: pick.index) ?? [])
+                    return
+                }
                 performMove(from: pick.pile, count: count, to: dest, metrics: metrics)
             }
     }
@@ -573,12 +706,15 @@ struct ContentView: View {
             animated(.cardSnap) { activeDrag = nil }
             if target != nil {
                 UINotificationFeedbackGenerator().notificationOccurred(.warning)
+                // Shake once the stack is home, so it reads as "not there".
+                shake(drag.cards, after: .milliseconds(200))
             }
         }
     }
 
     private func performMove(from source: Pile, count: Int, to dest: Pile, metrics: CardSize, alongside: () -> Void = {}) {
         let landing = cardOrigin(pile: dest, index: destinationIndex(for: dest), metrics: metrics)
+        let exposed = cardToBeExposed(from: source, count: count)
         var moved = false
         animated {
             moved = game.move(from: source, count: count, to: dest)
@@ -587,6 +723,135 @@ struct ContentView: View {
         if moved {
             UIImpactFeedbackGenerator(style: .medium).impactOccurred()
             spawnBurst(at: CGPoint(x: landing.x + metrics.width / 2, y: landing.y), delta: game.lastDelta)
+            reactToMove(to: dest, exposed: exposed, metrics: metrics)
+        }
+    }
+
+    /// The face-down card a move from `source` will uncover, if any.
+    private func cardToBeExposed(from source: Pile, count: Int) -> UUID? {
+        guard case .tableau(let column) = source else { return nil }
+        let cards = game.tableau[column]
+        let index = cards.count - count - 1
+        guard cards.indices.contains(index), !cards[index].isFaceUp else { return nil }
+        return cards[index].id
+    }
+
+    /// Small rewards once a move lands: an uncovered card bounces as it turns over, a card
+    /// reaching a foundation bounces and the pile glows, and a finished suit throws sparks.
+    private func reactToMove(to dest: Pile, exposed: UUID?, metrics: CardSize) {
+        var landed: (id: UUID, frame: CGRect, completesSuit: Bool)?
+        if case .foundation(let i) = dest, let card = game.foundations[i].last, let frame = pileFrames[dest] {
+            landed = (card.id, frame, game.foundations[i].count == 13)
+        }
+        guard exposed != nil || landed != nil else { return }
+        Task {
+            try? await Task.sleep(for: .milliseconds(190))
+            if let exposed, !reduceMotion { pops[exposed, default: 0] += 1 }
+            guard let landed else { return }
+            try? await Task.sleep(for: .milliseconds(70))
+            if !reduceMotion { pops[landed.id, default: 0] += 1 }
+            spawnRipple(landed.frame, strong: landed.completesSuit)
+            if landed.completesSuit {
+                if !game.isWon { UINotificationFeedbackGenerator().notificationOccurred(.success) }
+                if !reduceMotion { spawnSparks(at: CGPoint(x: landed.frame.midX, y: landed.frame.midY), scale: metrics.width) }
+            }
+        }
+    }
+
+    private func shake(_ cards: [Card], after delay: Duration = .zero) {
+        guard !reduceMotion, !cards.isEmpty else { return }
+        Task {
+            if delay > .zero { try? await Task.sleep(for: delay) }
+            for card in cards { shakes[card.id, default: 0] += 1 }
+        }
+    }
+
+    // MARK: - Hints
+
+    /// Points out the best move. Asking again while a hint is showing steps to the next best one.
+    private func showHint() {
+        guard !isBusy, !game.isWon, activeDrag == nil else { return }
+        hintTaps += 1
+        hintSeq += 1
+        let seq = hintSeq
+        let options = game.hints()
+        let message: String
+        if options.isEmpty {
+            message = game.canUndo ? "No useful moves left. Try Undo." : "No useful moves left. Try a new game."
+            withAnimation(.cardSnap) {
+                hint = nil
+                hintMessage = message
+            }
+            UINotificationFeedbackGenerator().notificationOccurred(.warning)
+        } else {
+            hintIndex = hint == nil ? 0 : (hintIndex + 1) % options.count
+            let next = options[hintIndex]
+            message = next.text
+            withAnimation(.cardSnap) {
+                hint = next
+                hintMessage = message
+            }
+            UIImpactFeedbackGenerator(style: .light).impactOccurred()
+            if !reduceMotion { nudgeHinted(next) }
+        }
+        AccessibilityNotification.Announcement(message).post()
+        Task {
+            try? await Task.sleep(for: .seconds(5))
+            if hintSeq == seq { clearHint() }
+        }
+    }
+
+    private func clearHint() {
+        guard hint != nil || hintMessage != nil else { return }
+        hintSeq += 1
+        withAnimation(.easeOut(duration: 0.2)) {
+            hint = nil
+            hintMessage = nil
+        }
+    }
+
+    /// Bounces the cards a hint is about, so the eye lands on them first.
+    private func nudgeHinted(_ hint: Hint) {
+        switch hint.action {
+        case .move(let source, let count, _):
+            for card in cards(in: source).suffix(count) { pops[card.id, default: 0] += 1 }
+        case .draw:
+            if let top = game.stock.last { pops[top.id, default: 0] += 1 }
+        case .recycle:
+            break
+        }
+    }
+
+    private func cards(in pile: Pile) -> [Card] {
+        switch pile {
+        case .stock: game.stock
+        case .waste: game.waste
+        case .foundation(let i): game.foundations[i]
+        case .tableau(let column): game.tableau[column]
+        }
+    }
+
+    /// Where a hint's cards are now and, for a move, where they would come to rest.
+    private func hintFrames(_ hint: Hint, metrics: CardSize) -> (source: CGRect, landing: CGRect?)? {
+        let card = CGSize(width: metrics.width, height: metrics.height)
+        switch hint.action {
+        case .draw, .recycle:
+            guard let frame = pileFrames[.stock] else { return nil }
+            return (CGRect(origin: frame.origin, size: card), nil)
+        case .move(let source, let count, let dest):
+            let total = cards(in: source).count
+            guard count > 0, total >= count, pileFrames[source] != nil, pileFrames[dest] != nil else { return nil }
+            let first = cardOrigin(pile: source, index: total - count, metrics: metrics)
+            let last = cardOrigin(pile: source, index: total - 1, metrics: metrics)
+            let size = CGSize(width: card.width, height: last.y - first.y + card.height)
+            let landing: CGPoint = {
+                // On a tableau column the cards land one step below its last card.
+                if case .tableau(let column) = dest {
+                    return cardOrigin(pile: dest, index: game.tableau[column].count, metrics: metrics)
+                }
+                return pileFrames[dest]?.origin ?? .zero
+            }()
+            return (CGRect(origin: first, size: size), CGRect(origin: landing, size: size))
         }
     }
 
@@ -597,6 +862,7 @@ struct ContentView: View {
         while !game.isWon {
             guard let (source, dest) = game.nextFoundationMove() else { break }
             animated(.cardDeal) { _ = game.move(from: source, count: 1, to: dest, recordUndo: false) }
+            reactToMove(to: dest, exposed: nil, metrics: metrics(in: boardSize))
             UIImpactFeedbackGenerator(style: .light).impactOccurred(intensity: 0.6)
             try? await Task.sleep(for: .milliseconds(85))
         }
@@ -627,7 +893,11 @@ struct ContentView: View {
         Task {
             isDealing = true
             withAnimation(.easeOut(duration: 0.2)) { showWinPanel = false }
+            clearHint()
             bursts.removeAll()
+            ripples.removeAll()
+            sparks.removeAll()
+            confettiID = nil
             activeDrag = nil
             if celebrating || game.moves > 0 {
                 animated(.cardMove) {
@@ -645,6 +915,9 @@ struct ContentView: View {
                 pendingDeal = Set(game.tableau.flatMap { $0.map(\.id) })
                 gathering = false
                 raised.removeAll()
+                // The old cards are gone, so their counters can go without replaying anything.
+                pops.removeAll()
+                shakes.removeAll()
             }
             await dealIn()
         }
@@ -669,6 +942,24 @@ struct ContentView: View {
         Task {
             try? await Task.sleep(for: .milliseconds(1000))
             bursts.removeAll { $0.id == burst.id }
+        }
+    }
+
+    private func spawnRipple(_ frame: CGRect, strong: Bool) {
+        let ripple = Ripple(frame: frame, strong: strong)
+        ripples.append(ripple)
+        Task {
+            try? await Task.sleep(for: .seconds(LandingRipple.duration(strong: strong)))
+            ripples.removeAll { $0.id == ripple.id }
+        }
+    }
+
+    private func spawnSparks(at point: CGPoint, scale: CGFloat) {
+        let burst = Sparks(point: point, scale: scale)
+        sparks.append(burst)
+        Task {
+            try? await Task.sleep(for: .seconds(ParticleBurst.sparksDuration))
+            sparks.removeAll { $0.id == burst.id }
         }
     }
 
@@ -767,10 +1058,25 @@ struct ContentView: View {
 
     private func metrics(in size: CGSize) -> CardSize {
         let spacing: CGFloat = 4
-        let width = (size.width - 10 - spacing * 6) / 7
-        let height = width * 1.46
-        // Everything above the tableau: top padding, header, gap, top row, row spacing, bottom padding.
-        let tableauHeight = max(height * 2, size.height - 6 - 40 - 8 - height - 22 - 12)
+        let aspect: CGFloat = 1.46
+        let sideRails = size.width > size.height
+        let railGap: CGFloat = sideRails ? 10 : 0
+        let width: CGFloat
+        let tableauHeight: CGFloat
+        if sideRails {
+            // Landscape: the foundations and the stock move into rails beside the tableau so the
+            // columns get the full height. Cards are sized by whichever runs out first: the width
+            // for nine piles across, or the height for four foundations stacked in a rail.
+            tableauHeight = size.height - 6 - 40 - 8 - 12
+            let byWidth = (size.width - 10 - spacing * 6 - railGap * 2) / 9
+            let byHeight = (tableauHeight - spacing * 2 * 3) / (4 * aspect)
+            width = max(1, min(byWidth, byHeight))
+        } else {
+            width = max(1, (size.width - 10 - spacing * 6) / 7)
+            // Everything above the tableau: top padding, header, gap, top row, row spacing, bottom padding.
+            tableauHeight = max(width * aspect * 2, size.height - 6 - 40 - 8 - width * aspect - 22 - 12)
+        }
+        let height = width * aspect
         let indexBand = width * 0.50 * faceTheme.indexScale + 4
         return CardSize(
             width: width,
@@ -780,7 +1086,10 @@ struct ContentView: View {
             spacing: spacing,
             minFacePeek: indexBand,
             minBackPeek: max(5, height * 0.07),
-            tableauHeight: tableauHeight
+            tightFacePeek: indexBand * 0.62,
+            tableauHeight: tableauHeight,
+            sideRails: sideRails,
+            railGap: railGap
         )
     }
 }
@@ -796,29 +1105,71 @@ private struct PileSlots: View, Equatable {
     var showRecycle: Bool
 
     var body: some View {
-        VStack(spacing: 22) {
-            topRow
-            HStack(alignment: .top, spacing: metrics.spacing) {
-                ForEach(0..<7, id: \.self) { column in
-                    EmptyPileView(size: metrics)
-                        .frame(maxHeight: .infinity, alignment: .top)
-                        .reportFrame(.tableau(column))
-                }
+        if metrics.sideRails {
+            // Landscape: foundations down one side, stock and waste down the other.
+            HStack(alignment: .top, spacing: 0) {
+                if leftHanded { stockRail } else { foundationRail }
+                Spacer(minLength: metrics.railGap)
+                tableau
+                Spacer(minLength: metrics.railGap)
+                if leftHanded { foundationRail } else { stockRail }
             }
-            .frame(maxHeight: .infinity, alignment: .top)
+        } else {
+            VStack(spacing: 22) {
+                topRow
+                tableau
+            }
+        }
+    }
+
+    private var tableau: some View {
+        HStack(alignment: .top, spacing: metrics.spacing) {
+            ForEach(0..<7, id: \.self) { column in
+                EmptyPileView(size: metrics)
+                    .frame(maxHeight: .infinity, alignment: .top)
+                    .reportFrame(.tableau(column))
+            }
+        }
+        .frame(maxHeight: .infinity, alignment: .top)
+    }
+
+    private var foundationRail: some View {
+        VStack(spacing: metrics.railSpacing) {
+            foundations
+        }
+    }
+
+    private var stockRail: some View {
+        VStack(spacing: metrics.railSpacing * 1.5) {
+            stockSlot
+            EmptyPileView(size: metrics)
+                .frame(height: metrics.height + (drawCount == 3 ? metrics.railFanStep * 2 : 0), alignment: .top)
+                .reportFrame(.waste)
         }
     }
 
     private var topRow: some View {
         HStack(alignment: .top, spacing: metrics.spacing) {
             if leftHanded {
-                stockSlot
-                wasteSlot
-                Spacer(minLength: 6)
+                stockAndWaste
+                Spacer(minLength: 2)
                 foundations
             } else {
                 foundations
-                Spacer(minLength: 6)
+                Spacer(minLength: 2)
+                stockAndWaste
+            }
+        }
+    }
+
+    /// The stock and the waste sit a little further apart than the other piles, so the
+    /// stock's stacked edge never crowds the card beside it.
+    private var stockAndWaste: some View {
+        HStack(alignment: .top, spacing: metrics.stockGap) {
+            if leftHanded {
+                stockSlot
+                wasteSlot
+            } else {
                 wasteSlot
                 stockSlot
             }

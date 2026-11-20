@@ -77,6 +77,23 @@ enum Pile: Hashable, Sendable {
     case tableau(Int)
 }
 
+/// A suggested next step, ranked against the other things the player could do.
+struct Hint: Equatable, Sendable {
+    enum Action: Equatable, Sendable {
+        case move(from: Pile, count: Int, to: Pile)
+        /// Turn cards from the stock onto the waste.
+        case draw
+        /// Flip the waste back over into an empty stock.
+        case recycle
+    }
+
+    var action: Action
+    /// Short description for the player, e.g. "Move 7♥ onto 8♠".
+    var text: String
+    /// Higher is better. Only meaningful relative to the other hints for the same position.
+    var priority: Int
+}
+
 struct GameSnapshot {
     var stock: [Card]
     var waste: [Card]
@@ -307,6 +324,188 @@ final class SolitaireGame {
     func applyNextAutoFinishStep() -> Bool {
         guard let (source, dest) = nextFoundationMove() else { return false }
         return move(from: source, count: 1, to: dest, recordUndo: false)
+    }
+
+    // MARK: - Hints
+
+    /// The single best suggestion, or nil when nothing useful is left to do.
+    func bestHint() -> Hint? { hints().first }
+
+    /// Every move worth suggesting, best first. Moves that only shuffle cards around without
+    /// uncovering, placing or freeing anything are left out, so an empty result means the
+    /// game is stuck as far as straightforward play goes.
+    func hints() -> [Hint] {
+        guard !isWon else { return [] }
+        var result: [Hint] = []
+
+        func name(_ card: Card) -> String { "\(card.rank.display)\(card.suit.symbol)" }
+
+        func foundationIndex(for card: Card) -> Int? {
+            (0..<4).first { canDrop([card], on: .foundation($0)) }
+        }
+
+        // Clearing a column only helps while there is no space yet and a king could use one:
+        // a king on the waste, somewhere in the stock, or still sitting on face-down cards.
+        let fromStock = cardsStockCanSurface()
+        let kingNeedsColumn = !tableau.contains(where: \.isEmpty)
+            && (waste.last?.rank == .king
+                || fromStock.contains { $0.rank == .king }
+                || tableau.contains { column in
+                    column.indices.contains { $0 > 0 && column[$0].isFaceUp && column[$0].rank == .king }
+                })
+
+        /// The run a column would move to turn over its top face-down card.
+        func buriedRun(in column: Int) -> [Card]? {
+            let cards = tableau[column]
+            guard let firstFaceUp = cards.firstIndex(where: \.isFaceUp), firstFaceUp > 0 else { return nil }
+            return Array(cards[firstFaceUp...])
+        }
+
+        func landsOn(_ card: Card, _ parent: Card) -> Bool {
+            parent.suit.isRed != card.suit.isRed && card.rank.rawValue == parent.rank.rawValue - 1
+        }
+
+        /// True when a run that would turn over a face-down card is waiting to land on `card`.
+        func isWantedByBuriedRun(_ card: Card, excluding column: Int) -> Bool {
+            (0..<7).contains { other in
+                guard other != column, let run = buriedRun(in: other) else { return false }
+                return landsOn(run[0], card)
+            }
+        }
+
+        // 1. Straight to a foundation.
+        if let card = waste.last, let i = foundationIndex(for: card) {
+            result.append(Hint(
+                action: .move(from: .waste, count: 1, to: .foundation(i)),
+                text: "Move \(name(card)) to the foundation",
+                priority: 1000 + (14 - card.rank.rawValue)
+            ))
+        }
+        for column in 0..<7 {
+            guard let card = tableau[column].last, let i = foundationIndex(for: card) else { continue }
+            let reveals = willFlipExposed(in: .tableau(column), count: 1)
+            // Leave a card in place while another pile needs to land on it to turn a card over.
+            let holdBack = !reveals && isWantedByBuriedRun(card, excluding: column)
+            result.append(Hint(
+                action: .move(from: .tableau(column), count: 1, to: .foundation(i)),
+                text: "Move \(name(card)) to the foundation",
+                priority: holdBack ? 750 : 1000 + (14 - card.rank.rawValue) + (reveals ? 40 : 0)
+            ))
+        }
+
+        // 2. Around the tableau.
+        for column in 0..<7 {
+            let cards = tableau[column]
+            guard let firstFaceUp = cards.firstIndex(where: \.isFaceUp) else { continue }
+            let faceDown = firstFaceUp
+            for start in firstFaceUp..<cards.count {
+                let run = Array(cards[start...])
+                let count = run.count
+                for target in 0..<7 where target != column && canDrop(run, on: .tableau(target)) {
+                    let onto = tableau[target].last
+                    let priority: Int
+                    if start == firstFaceUp, faceDown > 0 {
+                        // Turns over a face-down card; dig out the deepest pile first.
+                        priority = 800 + faceDown * 5 + (onto == nil ? 0 : 2)
+                    } else if start == 0 {
+                        // Clears the column. Only worth it when a king is waiting to take the space.
+                        guard onto != nil, kingNeedsColumn else { continue }
+                        priority = 500
+                    } else {
+                        // Splits a run. Worth it only if the card it uncovers can go straight up.
+                        guard foundationIndex(for: cards[start - 1]) != nil else { continue }
+                        priority = 600
+                    }
+                    let subject = count == 1 ? name(run[0]) : "the run from \(name(run[0]))"
+                    let place = onto.map { "onto \(name($0))" } ?? "to the empty column"
+                    result.append(Hint(
+                        action: .move(from: .tableau(column), count: count, to: .tableau(target)),
+                        text: "Move \(subject) \(place)",
+                        priority: priority
+                    ))
+                }
+            }
+        }
+
+        // 3. Waste onto the tableau.
+        if let card = waste.last {
+            for target in 0..<7 where canDrop([card], on: .tableau(target)) {
+                let onto = tableau[target].last
+                let place = onto.map { "onto \(name($0))" } ?? "to the empty column"
+                result.append(Hint(
+                    action: .move(from: .waste, count: 1, to: .tableau(target)),
+                    text: "Move \(name(card)) \(place)",
+                    priority: 700
+                ))
+                // One home is enough for a waste card; a second empty column adds nothing.
+                if onto == nil { break }
+            }
+        }
+
+        // 4. Back down from a foundation, when that is the only way to turn over a face-down card.
+        for f in 0..<4 {
+            guard let card = foundations[f].last, card.rank != .ace else { continue }
+            for column in 0..<7 {
+                guard let run = buriedRun(in: column), landsOn(run[0], card) else { continue }
+                // Not needed if the run already has somewhere to go.
+                guard !(0..<7).contains(where: { $0 != column && canDrop(run, on: .tableau($0)) }) else { continue }
+                guard let target = (0..<7).first(where: { $0 != column && !tableau[$0].isEmpty && canDrop([card], on: .tableau($0)) }),
+                      let onto = tableau[target].last
+                else { continue }
+                result.append(Hint(
+                    action: .move(from: .foundation(f), count: 1, to: .tableau(target)),
+                    text: "Bring \(name(card)) back down onto \(name(onto)) to make room for \(name(run[0]))",
+                    priority: 300
+                ))
+                break
+            }
+        }
+
+        // 5. The stock, but only if going through it can turn up a card that has somewhere to go.
+        let current = waste.last
+        let stockHelps = fromStock.contains { card in
+            // The card already on top of the waste is covered by the direct moves above.
+            guard card != current else { return false }
+            let single = [card]
+            return (0..<4).contains { canDrop(single, on: .foundation($0)) }
+                || (0..<7).contains { canDrop(single, on: .tableau($0)) }
+        }
+        if stockHelps {
+            if stock.isEmpty {
+                result.append(Hint(action: .recycle, text: "Turn the waste pile back over", priority: 100))
+            } else {
+                result.append(Hint(action: .draw, text: "Draw from the stock", priority: 100))
+            }
+        }
+
+        // Stable, so equal-priority moves keep their left-to-right order.
+        return result.enumerated()
+            .sorted { $0.element.priority != $1.element.priority ? $0.element.priority > $1.element.priority : $0.offset < $1.offset }
+            .map(\.element)
+    }
+
+    /// Every card that reaches the top of the waste while dealing through the stock, and once
+    /// more after turning the waste over, without playing anything in between.
+    private func cardsStockCanSurface() -> [Card] {
+        guard !stock.isEmpty || !waste.isEmpty else { return [] }
+        var stock = stock
+        var waste = waste
+        var surfaced: [Card] = []
+
+        func dealThrough() {
+            while !stock.isEmpty {
+                for _ in 0..<min(drawCount, stock.count) {
+                    waste.append(stock.removeLast())
+                }
+                if let top = waste.last { surfaced.append(top) }
+            }
+        }
+
+        dealThrough()
+        stock = waste.reversed()
+        waste = []
+        dealThrough()
+        return surfaced
     }
 
     func topCard(of pile: Pile) -> Card? {
